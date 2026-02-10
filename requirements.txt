@@ -1,0 +1,7 @@
+# 安装 torch 请按 https://pytorch.org/ 指引选择正确的命令（CPU/GPU 区别）
+numpy
+mido
+matplotlib
+scikit-learn
+tqdm
+tensorboard
