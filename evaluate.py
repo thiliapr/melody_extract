@@ -185,8 +185,8 @@ def main(args: argparse.Namespace):
     all_logits = torch.cat(logits)
     all_labels = torch.cat(labels)
     overall_loss, overall_auc = compute_metrics(all_logits, all_labels)
-    writer.add_text("Evaluate/Overall Loss", overall_loss, checkpoint["completed_steps"])
-    writer.add_text("Evaluate/Overall AUC", overall_auc, checkpoint["completed_steps"])
+    writer.add_text("Evaluate/Overall Loss", str(overall_loss), checkpoint["completed_steps"])
+    writer.add_text("Evaluate/Overall AUC", str(overall_auc), checkpoint["completed_steps"])
     add_pr_curve(writer, "Evaluate/Overall PR Curve", all_labels.numpy(), F.sigmoid(all_logits).numpy(), checkpoint["completed_steps"])
     add_roc_curve(writer, "Evaluate/Overall ROC Curve", all_labels.numpy(), F.sigmoid(all_logits).numpy(), checkpoint["completed_steps"])
 
