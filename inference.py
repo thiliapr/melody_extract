@@ -75,7 +75,7 @@ def main(args: argparse.Namespace):
         probabilities[batch_start:batch_start + args.batch_size] = model({
             "piano_roll": piano_roll.float(),
             "interval": interval
-        })["logits"].sigmoid()  # [batch_size]
+        })["logit"].sigmoid()  # [batch_size]
 
     # 合并各轨道的音符
     all_notes = {
