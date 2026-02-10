@@ -21,6 +21,34 @@ thiliapr/melody_extract 是自由软件，遵循[Affero GNU 通用公共许可�
   - 第一个轨道 ≠ 第一个有音符的轨道，比如若干个轨道可以只包含 MetaMessage，指定轨道名（可能是作者名、曲名之类），数据提取时会忽略这些无音符轨道
   - 牢记[垃圾进，垃圾出](https://www.ebsco.com/research-starters/computer-science/garbage-garbage-out-gigo)这个机器学习普世真理
 
+### 训练集目录结构应该长什么样
+#### 结构示意图
+```plaintext
+trainset/
+├── touhou/
+│   ├── Touhou 7 PCB.mid
+│   ├── Touhou 19 UDoALG.mid
+├── fix/
+│   ├── A File that Tests Badly.mid
+└── metadata.json
+```
+
+### `metadata.json` 示例
+```json
+{
+  "weights": {
+    "touhou": 1.989,
+    "fix": 0.604,
+    "组的目录名": 0.721
+  }
+}
+```
+
+#### 解释
+- 你得把文件分组，所有 MIDI 文件必须在子目录下，而不是直接在根目录下
+- `metadata.json`: 必须在根目录下。通过此文件，你可以配置每个组的权重，这会影响他们在训练时被抽取的概率
+- 只要求对训练集进行此操作，验证集你随意，只要包含 MIDI 文件就行
+
 ### 安装依赖
 PyTorch 需要根据你的操作系统与硬件手动安装，请访问[官方安装页面](https://pytorch.org/)获取适合您系统的安装命令。  
 安装 PyTorch 完成后，你得安装 `requirements.txt` 的依赖。  

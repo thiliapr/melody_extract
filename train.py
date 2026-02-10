@@ -6,6 +6,7 @@
 import argparse
 import pathlib
 import random
+import json
 from typing import Iterator, Optional, TypedDict
 import mido
 import torch
@@ -102,115 +103,144 @@ class DatasetWithoutAugmentation(IterableDataset):
 class DatasetWithAugmentation(IterableDataset):
     def __init__(self, midi_dir: pathlib.Path):
         super().__init__()
-        self.data = []
-        num_positive = num_negative = 0
-        for midi_file in tqdm(midi_dir.glob("**/*.mid"), desc="Loading MIDI files"):
-            # 加载 MIDI 文件数据
-            midi_file = mido.MidiFile(midi_file, clip=True)
-            tracks = midi_to_tracks(midi_file)
-            melody_notes = tracks[0]
 
-            # 收集所有音轨中的所有时间点，去重排序，创建时间点到索引的映射
-            times = sorted({time for track in tracks for _, time in track})
-            time_to_index = {time: i for i, time in enumerate(times)}
+        # 初始化数据列表和全局正负样本权重统计
+        self.data: list[list[dict[str, np.ndarray]]] = []
+        global_pos_weights = []
+        if (metadata_path := midi_dir / "metadata.json").exists():
+            metadata = json.loads(metadata_path.read_text("utf-8"))
+        else:
+            metadata = {}
+        self.group_weights = []
 
-            # 创建主旋律标志数组，标记哪些时间点有主旋律音符，并更新统计信息
-            melody_flags = np.zeros(len(times), dtype=bool)
-            for _, time in melody_notes:
-                melody_flags[time_to_index[time]] = True
-            num_positive += melody_flags.sum()
-            num_negative += (~melody_flags).sum()
+        # 遍历 MIDI 目录中的每个组（子目录），并处理其中的 MIDI 文件
+        for group_dir in midi_dir.iterdir():
+            group = []
+            group_pos_weights = []
 
-            # 计算相邻时间点之间的间隔，并限制在最大间隔范围内
-            times = np.array(times, dtype=int)
-            intervals = np.clip(times[1:] - times[:-1], 0, MAX_INTERVAL)
+            # 遍历组目录中的每个 MIDI 文件，加载并处理数据
+            for midi_file in tqdm(group_dir.rglob("*.mid"), desc=f"Loading Group `{group_dir.name}`"):
+                # 加载 MIDI 文件数据
+                midi_file = mido.MidiFile(midi_file, clip=True)
+                tracks = midi_to_tracks(midi_file)
+                melody_notes = tracks[0]
 
-            # 填充主旋律钢琴卷帘和音高统计
-            melody_piano_roll = np.zeros((len(times), 128), dtype=bool)
-            melody_max_pitch = np.zeros(len(times), dtype=np.uint8)
-            melody_min_pitch = np.full(len(times), 127, dtype=np.uint8)
-            for pitch, time in melody_notes:
-                melody_max_pitch[time_to_index[time]] = max(melody_max_pitch[time_to_index[time]], pitch)
-                melody_min_pitch[time_to_index[time]] = min(melody_min_pitch[time_to_index[time]], pitch)
-                melody_piano_roll[time_to_index[time], pitch] = True
+                # 收集所有音轨中的所有时间点，去重排序，创建时间点到索引的映射
+                times = sorted({time for track in tracks for _, time in track})
+                time_to_index = {time: i for i, time in enumerate(times)}
 
-            # 填充伴奏钢琴卷帘和音高统计
-            accomp_piano_roll = np.zeros((len(times), 128), dtype=bool)
-            accomp_max_pitch = np.zeros(len(times), dtype=np.uint8)
-            accomp_min_pitch = np.full(len(times), 127, dtype=np.uint8)
-            for track in tracks[1:]:
-                for pitch, time in track:
-                    accomp_max_pitch[time_to_index[time]] = max(accomp_max_pitch[time_to_index[time]], pitch)
-                    accomp_min_pitch[time_to_index[time]] = min(accomp_min_pitch[time_to_index[time]], pitch)
-                    accomp_piano_roll[time_to_index[time], pitch] = True
+                # 创建主旋律标志数组，标记哪些时间点有主旋律音符
+                melody_flags = np.zeros(len(times), dtype=bool)
+                for _, time in melody_notes:
+                    melody_flags[time_to_index[time]] = True
+                
+                # 更新正负样本权重统计，计算当前文件中负样本与正样本的比例，并添加到组内统计列表中
+                group_pos_weights.append((~melody_flags).sum() / melody_flags.sum())
 
-            # 计算每个时间点的音域偏移限制，以及每个窗口的时间间隔最大公约数
-            melody_down_octaves = np.empty(len(times), dtype=np.uint8)
-            melody_up_octaves = np.empty(len(times), dtype=np.int8)
-            accomp_shifts = np.empty(len(times), dtype=np.int8)
-            window_gcd = np.empty(len(times), dtype=int)
-            for i in range(len(times)):
-                # 计算当前窗口范围（以当前时间点为中心）
-                start = max(0, i - WINDOW_SIZE // 2)
-                end = min(len(times), i + WINDOW_SIZE // 2 + 1)
-                # 计算窗口时间间隔最大公约数
-                window_gcd[i] = np.gcd.reduce(intervals[start:end])
-                # 计算窗口内最大和最小音高
-                window_melody_max = melody_max_pitch[start:end].max()
-                window_melody_min = melody_min_pitch[start:end].min()
-                window_accomp_max = accomp_max_pitch[start:end].max()
-                window_accomp_min = accomp_min_pitch[start:end].min()
-                # 如果当前窗口只有伴奏或者主旋律音符，则跳过当前窗口
-                # 如果最大值小于最小值，这说明这个窗口的统计数据都没有被改变，进而说明这个窗口没有对应类型的音符
-                if window_melody_max < window_melody_min or window_accomp_max < window_accomp_min:
-                    melody_up_octaves[i] = -1  # 标志跳过该窗口
-                    continue
-                # 计算主旋律在当前窗口内可向下移动的最大八度数，向下移动后还可向上移动的最大八度数
-                melody_down_octaves[i] = window_melody_min // 12
-                melody_up_octaves[i] = (127 - (window_melody_max - melody_down_octaves[i] * 12)) // 12
-                # 计算伴奏移动的半音数，使伴奏居于中下的音域（以12个半音为单位）
-                accomp_up_octaves = (127 - window_accomp_max).item() // 12
-                accomp_down_octaves = window_accomp_min.item() // 12
-                accomp_shifts[i] = max(accomp_up_octaves - accomp_down_octaves - 2, -accomp_down_octaves) * 12
+                # 计算相邻时间点之间的间隔，并限制在最大间隔范围内
+                times = np.array(times, dtype=int)
+                intervals = np.clip(times[1:] - times[:-1], 0, MAX_INTERVAL)
 
-            # 对数据进行填充，以便后续窗口操作
-            intervals = np.pad(intervals, (WINDOW_SIZE // 2 + 1, WINDOW_SIZE // 2))
-            melody_piano_roll = np.pad(melody_piano_roll, ((WINDOW_SIZE // 2, WINDOW_SIZE // 2), (0, 0)))
-            accomp_piano_roll = np.pad(accomp_piano_roll, ((WINDOW_SIZE // 2, WINDOW_SIZE // 2), (0, 0)))
+                # 填充主旋律钢琴卷帘和音高统计
+                melody_piano_roll = np.zeros((len(times), 128), dtype=bool)
+                melody_max_pitch = np.zeros(len(times), dtype=np.uint8)
+                melody_min_pitch = np.full(len(times), 127, dtype=np.uint8)
+                for pitch, time in melody_notes:
+                    melody_max_pitch[time_to_index[time]] = max(melody_max_pitch[time_to_index[time]], pitch)
+                    melody_min_pitch[time_to_index[time]] = min(melody_min_pitch[time_to_index[time]], pitch)
+                    melody_piano_roll[time_to_index[time], pitch] = True
 
-            # 将处理好的数据添加到列表中
-            self.data.append({
-                "intervals": intervals,
-                "melody_piano_roll": melody_piano_roll,
-                "accomp_piano_roll": accomp_piano_roll,
-                "melody_flags": melody_flags,
-                "melody_down_octaves": melody_down_octaves,
-                "melody_up_octaves": melody_up_octaves,
-                "accomp_shifts": accomp_shifts,
-                "window_gcd": window_gcd
-            })
+                # 填充伴奏钢琴卷帘和音高统计
+                accomp_piano_roll = np.zeros((len(times), 128), dtype=bool)
+                accomp_max_pitch = np.zeros(len(times), dtype=np.uint8)
+                accomp_min_pitch = np.full(len(times), 127, dtype=np.uint8)
+                for track in tracks[1:]:
+                    for pitch, time in track:
+                        accomp_max_pitch[time_to_index[time]] = max(accomp_max_pitch[time_to_index[time]], pitch)
+                        accomp_min_pitch[time_to_index[time]] = min(accomp_min_pitch[time_to_index[time]], pitch)
+                        accomp_piano_roll[time_to_index[time], pitch] = True
+
+                # 计算每个时间点的音域偏移限制，以及每个窗口的时间间隔最大公约数
+                melody_down_octaves = np.empty(len(times), dtype=np.uint8)
+                melody_up_octaves = np.empty(len(times), dtype=np.int8)
+                accomp_shifts = np.empty(len(times), dtype=np.int8)
+                window_gcd = np.empty(len(times), dtype=int)
+                for i in range(len(times)):
+                    # 计算当前窗口范围（以当前时间点为中心）
+                    start = max(0, i - WINDOW_SIZE // 2)
+                    end = min(len(times), i + WINDOW_SIZE // 2 + 1)
+                    # 计算窗口时间间隔最大公约数
+                    window_gcd[i] = np.gcd.reduce(intervals[start:end])
+                    # 计算窗口内最大和最小音高
+                    window_melody_max = melody_max_pitch[start:end].max()
+                    window_melody_min = melody_min_pitch[start:end].min()
+                    window_accomp_max = accomp_max_pitch[start:end].max()
+                    window_accomp_min = accomp_min_pitch[start:end].min()
+                    # 如果当前窗口只有伴奏或者主旋律音符，则跳过当前窗口
+                    # 如果最大值小于最小值，这说明这个窗口的统计数据都没有被改变，进而说明这个窗口没有对应类型的音符
+                    if window_melody_max < window_melody_min or window_accomp_max < window_accomp_min:
+                        melody_up_octaves[i] = -1  # 标志跳过该窗口
+                        continue
+                    # 计算主旋律在当前窗口内可向下移动的最大八度数，向下移动后还可向上移动的最大八度数
+                    melody_down_octaves[i] = window_melody_min // 12
+                    melody_up_octaves[i] = (127 - (window_melody_max - melody_down_octaves[i] * 12)) // 12
+                    # 计算伴奏移动的半音数，使伴奏居于中下的音域（以12个半音为单位）
+                    accomp_up_octaves = (127 - window_accomp_max).item() // 12
+                    accomp_down_octaves = window_accomp_min.item() // 12
+                    accomp_shifts[i] = max(accomp_up_octaves - accomp_down_octaves - 2, -accomp_down_octaves) * 12
+
+                # 对数据进行填充，以便后续窗口操作
+                intervals = np.pad(intervals, (WINDOW_SIZE // 2 + 1, WINDOW_SIZE // 2))
+                melody_piano_roll = np.pad(melody_piano_roll, ((WINDOW_SIZE // 2, WINDOW_SIZE // 2), (0, 0)))
+                accomp_piano_roll = np.pad(accomp_piano_roll, ((WINDOW_SIZE // 2, WINDOW_SIZE // 2), (0, 0)))
+
+                # 将处理好的数据添加到列表中
+                group.append({
+                    "intervals": intervals,
+                    "melody_piano_roll": melody_piano_roll,
+                    "accomp_piano_roll": accomp_piano_roll,
+                    "melody_flags": melody_flags,
+                    "melody_down_octaves": melody_down_octaves,
+                    "melody_up_octaves": melody_up_octaves,
+                    "accomp_shifts": accomp_shifts,
+                    "window_gcd": window_gcd
+                })
+
+            # 跳过没有有效窗口的组
+            if group:
+                # 添加当前组的正负样本权重统计到全局统计列表中，计算当前组的平均正负样本权重比例，并添加到全局统计列表中
+                global_pos_weights.append(sum(group_pos_weights) / len(group_pos_weights))
+                self.data.append(group)
+
+                # 从元数据中获取当前组的权重，如果没有则默认为 1.0，并添加到组权重列表中
+                self.group_weights.append(metadata.get("weights", {}).get(group_dir.name, 1.0))
 
         # 统计最佳的正负样本权重比例
-        self.pos_weight = torch.tensor(num_negative / num_positive, dtype=torch.float32)
+        self.pos_weight = torch.tensor(sum(
+            group_pos_weight * group_weight
+            for group_pos_weight, group_weight in zip(global_pos_weights, self.group_weights)
+        ) / sum(group_pos_weights), dtype=torch.float32)
 
     def __iter__(self) -> Iterator[DatasetOutput]:
         while True:
-            # 随机选择一个文件及一个中心位置，以及主旋律的八度偏移（在允许范围内）
+            # 抽取一个组，然后从组中抽取一个文件，从文件中抽取一个中心位置
+            # 然后随机选择一个主旋律的八度偏移（在允许范围内）
             while True:
-                data = random.choice(self.data)
-                center_index = random.randint(0, len(data["melody_flags"]) - 1)
+                group = random.choices(self.data, self.group_weights, k=1)[0]
+                file_data = random.choice(group)
+                center_index = random.randint(0, len(file_data["melody_flags"]) - 1)
                 # 仅当窗口混合有主旋律和伴奏时选取
-                melody_up_range = data["melody_up_octaves"][center_index]
+                melody_up_range = file_data["melody_up_octaves"][center_index]
                 if melody_up_range != -1:
                     melody_octave_shift = random.randint(0, melody_up_range)
                     break
 
             # 伴奏移位，使伴奏居中下
-            accomp_piano_roll = np.roll(data["accomp_piano_roll"][center_index:center_index + WINDOW_SIZE], data["accomp_shifts"][center_index].item(), -1)
+            accomp_piano_roll = np.roll(file_data["accomp_piano_roll"][center_index:center_index + WINDOW_SIZE], file_data["accomp_shifts"][center_index].item(), -1)
 
             # 计算实际的八度变换（相对值），并对主旋律进行移位
-            melody_piano_roll = data["melody_piano_roll"][center_index:center_index + WINDOW_SIZE]
-            transform_octave = melody_octave_shift - data["melody_down_octaves"][center_index].item()
+            melody_piano_roll = file_data["melody_piano_roll"][center_index:center_index + WINDOW_SIZE]
+            transform_octave = melody_octave_shift - file_data["melody_down_octaves"][center_index].item()
             melody_piano_roll = np.roll(melody_piano_roll, transform_octave * 12, -1)
 
             # 合并主旋律和伴奏钢琴卷帘，并随机平移整个钢琴卷帘
@@ -222,13 +252,13 @@ class DatasetWithAugmentation(IterableDataset):
                 piano_roll = np.roll(piano_roll, random.randint(-pitches_existed.min(), 0), -1)
 
             # 随机缩放时间间隔
-            intervals = data["intervals"][center_index:center_index + WINDOW_SIZE] / data["window_gcd"][center_index]
+            intervals = file_data["intervals"][center_index:center_index + WINDOW_SIZE] / file_data["window_gcd"][center_index]
             intervals = intervals * random.randint(1, int(MAX_INTERVAL / intervals.max().item()))
 
             yield {
                 "piano_roll": piano_roll,
-                "interval": data["intervals"][center_index:center_index + WINDOW_SIZE],
-                "melody_flag": data["melody_flags"][center_index],
+                "interval": file_data["intervals"][center_index:center_index + WINDOW_SIZE],
+                "melody_flag": file_data["melody_flags"][center_index],
             }
 
 
