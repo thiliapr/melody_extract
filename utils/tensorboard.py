@@ -31,6 +31,7 @@ def add_pr_curve_raw(
     这的确很 weird。
 
     Source: https://github.com/pytorch/pytorch/blob/0cd681d12e6879f242edb3bf3c1810bf41bb69c1/torch/utils/tensorboard/summary.py#L811
+    Issue: https://github.com/pytorch/pytorch/issues/173311
     """
     data = np.stack((true_positive_counts, false_positive_counts, true_negative_counts, false_negative_counts, precision, recall))
     pr_curve_plugin_data = PrCurvePluginData(version=0, num_thresholds=num_thresholds).SerializeToString()
