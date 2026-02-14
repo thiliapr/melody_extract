@@ -115,6 +115,11 @@ class DatasetWithAugmentation(IterableDataset):
 
         # 遍历 MIDI 目录中的每个组（子目录），并处理其中的 MIDI 文件
         for group_dir in midi_dir.iterdir():
+            # 仅处理目录
+            if not group_dir.is_dir():
+                continue
+
+            # 初始化组内数据和正负样本权重
             group = []
             group_pos_weights = []
 
